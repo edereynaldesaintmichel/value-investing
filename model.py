@@ -28,9 +28,17 @@ def get_return_and_stat_price(stock:torch.Tensor):
     final_price = prices[0]
     non_minus_one_indices = (prices != -1).nonzero(as_tuple=True)[0]
     number_years_listed = non_minus_one_indices.numel()
-    if (number_years_listed <= 1):
+    if (number_years_listed <= 5):
         return 0, None, None
     last_index = non_minus_one_indices[-2]
+
+    # Check if there was a share split or a consolidation
+    yoy_price_change = (prices[:last_index-1] / prices[1:last_index])
+    likely_share_split = yoy_price_change.max() > 100 or yoy_price_change.min() < 0.01
+
+    if (likely_share_split):
+        return 0, None, None
+
     start_price = prices[last_index]
     dividend_returns = (dividends_per_share[:last_index]).sum()
 
@@ -57,6 +65,7 @@ ratio_limits = {
 }
 ratio_keys_indices = {key: fields.index(key) for key in ratios}
 fcf_ratios = []
+market_caps = []
 grouped_by_industry = {}
 for stock in data:
     if len(stock) < 1:
@@ -64,6 +73,9 @@ for stock in data:
     industry = reversed_industries.get(int(stock[0, industry_index]), '')
     stock_returns, start_price, start_index = get_return_and_stat_price(stock)
     if start_price is None:
+        continue
+    market_cap = start_price * stock[start_index, nb_shares_index]
+    if not 0 < market_cap < 1e12:
         continue
     if industry not in grouped_by_industry:
          grouped_by_industry[industry] = {
@@ -77,10 +89,10 @@ for stock in data:
                 'revenue': []
             }
         }
-    grouped_by_industry[industry]['returns'].append(stock_returns)
-
+    grouped_by_industry[industry]['returns'].append(stock_returns)    
 
     returns.append(stock_returns)
+    market_caps.append(market_cap)
     for key in ratios:
         ratio = stock[start_index, ratio_keys_indices[key]]/stock[start_index, nb_shares_index]/stock[start_index, price_index]
         ratios[key].append(ratio)
@@ -100,7 +112,7 @@ for industry, industry_results in grouped_by_industry.items():
         t = torch.tensor(industry_results['ratios'][key])
         t = t.nan_to_num(nan=0, posinf=1, neginf=-1)
         t = t.clamp(min=limits[0], max=limits[1])
-        correlation = torch.corrcoef(torch.stack([industry_returns, t]))[0,1]
+        correlation = torch.corrcoef(torch.stack([(industry_returns+1)**5, t]))[0,1]
         industry_correlations[industry][key] = correlation.item()
     industry_correlations[industry]['n_samples'] = industry_returns.numel()
 
@@ -110,16 +122,19 @@ for industry, industry_results in grouped_by_industry.items():
 # Aggregate ratios vs returns correlation 
 returns = torch.nan_to_num(torch.tensor(returns), nan=0, posinf=1, neginf=-1)
 returns = returns.clamp(min=-1, max=1)
+market_caps = torch.nan_to_num(torch.tensor(market_caps), nan=0, posinf=0, neginf=0)
+market_caps = market_caps.clamp(min=0, max=1e12)
 correlations = {}
 for key in ratios:
     limits = ratio_limits[key]
     t = torch.tensor(ratios[key])
     t = t.nan_to_num(nan=0, posinf=1, neginf=-1)
     t = t.clamp(min=limits[0], max=limits[1])
-    correlation = torch.corrcoef(torch.stack([returns, t]))[0,1]
+    correlation = torch.corrcoef(torch.stack([(returns+1)**5, t]))[0,1]
     correlations[key] = correlation
+correlations['n_samples'] = returns.numel()
 
-csv = '"Industry", "EPS/Price", "FCF/Price", "ebitda/Price", "Operating CF/Price", "Book/Price", "revenue", "N Samples"\n'
+csv = '"Industry", "EPS/Price", "FCF/Price", "ebitda/Price", "Operating CF/Price", "Book/Price", "Revenue/Sh/Price", "N Samples"\n'
 for key in industry_correlations:
     row = f'"{key}"'
     correlates = industry_correlations[key]
@@ -130,6 +145,12 @@ for key in industry_correlations:
     if correlates.get('n_samples', 0) < 5:
         continue
     csv += row
+
+csv_general = 'Ratio, Correlation\n'
+for key in correlations:
+    csv_general += f'{key}, {correlations[key]}\n'
+
+print(csv_general)
 
 
 print(csv)
