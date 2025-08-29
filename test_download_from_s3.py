@@ -6,16 +6,17 @@ import pandas as pd
 from botocore import UNSIGNED
 from botocore.config import Config
 from dotenv import load_dotenv
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Comment, NavigableString
 import pdfplumber
 import os
 from collections import defaultdict
-from readability import Document
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 import multiprocessing
 from functools import partial
 import logging
 from datetime import datetime
+import html2text
+import re
 
 load_dotenv()
 
@@ -25,9 +26,199 @@ logging.basicConfig(
     format='%(asctime)s - %(processName)s - %(message)s'
 )
 
+class HTMLSanitizer:
+    """Python translation of the custom JS HTML sanitization logic"""
+    
+    TAGS_TO_REMOVE = ['script', 'style', 'link', 'meta', 'noscript', 'iframe', 'svg', 'code', 'noscript', 'i', 'img']
+    QUERY_SELECTORS_TO_REMOVE = ["#ultimate_extension_div", '#toggle_ultimext']
+    TO_REMOVE_IF_EMPTY = ['div', 'span', 'li', 'p', 'td', 'th', 'tr', 'table', 'a', 'button', 'input']
+    TAGS_TO_KEEP = {'table', 'tr', 'th', 'td', 'thead', 'li', 'p'}
+    
+    @staticmethod
+    def clean_attributes(element):
+        """Remove all attributes from an element"""
+        if hasattr(element, 'attrs'):
+            element.attrs = {}
+    
+    @staticmethod
+    def normalize_whitespace(text):
+        """Normalize whitespace in text"""
+        if not text:
+            return text
+            
+        old_text = None
+        while old_text != text:
+            old_text = text
+            # Replace 2+ line breaks with single line break
+            text = re.sub(r'\n\s*\n', '\n', text)
+            # Replace 2+ spaces with single space
+            text = re.sub(r'[ \t]+', ' ', text)
+        
+        return text
+    
+    @classmethod
+    def only_child_policy(cls, element):
+        """Apply the only child policy from the JS version"""
+        if not element or isinstance(element, NavigableString):
+            return element
+            
+        # Clean attributes
+        cls.clean_attributes(element)
+        
+        # Remove empty text nodes
+        for child in list(element.children):
+            if isinstance(child, NavigableString) and not child.strip():
+                child.extract()
+        
+        children = list(element.children)
+        
+        # If element has only one child
+        if len(children) == 1:
+            child = children[0]
+            
+            # If we should keep this tag, process child and return element
+            if element.name and element.name.lower() in cls.TAGS_TO_KEEP:
+                if not isinstance(child, NavigableString):
+                    new_child = cls.only_child_policy(child)
+                    if new_child != child and new_child:
+                        # Replace the child with the processed version
+                        child.replace_with(new_child)
+                return element
+            
+            # If child is text, add space and return a new NavigableString
+            if isinstance(child, NavigableString):
+                # Create a new NavigableString with space prepended
+                new_string = NavigableString(" " + str(child))
+                return new_string
+            
+            # Otherwise, return the processed child
+            return cls.only_child_policy(child)
+        
+        # Process all children
+        for child in list(element.children):
+            if not isinstance(child, NavigableString):
+                new_child = cls.only_child_policy(child)
+                if new_child != child and new_child:
+                    try:
+                        child.replace_with(new_child)
+                    except:
+                        # If replacement fails, just continue
+                        pass
+        
+        return element
+    
+    @classmethod
+    def clean_html(cls, html_string):
+        """Main cleaning function"""
+        if not html_string:
+            return ""
+            
+        try:
+            soup = BeautifulSoup(html_string, 'html.parser')
+            
+            # Remove comments
+            for comment in soup.find_all(string=lambda text: isinstance(text, Comment)):
+                comment.extract()
+            
+            # Remove specific tags
+            for tag in cls.TAGS_TO_REMOVE:
+                for element in soup.find_all(tag):
+                    element.decompose()
+            
+            # Remove elements by query selector
+            for selector in cls.QUERY_SELECTORS_TO_REMOVE:
+                for element in soup.select(selector):
+                    element.decompose()
+            
+            # Apply only child policy to body
+            body = soup.body if soup.body else soup
+            
+            # Process the body
+            if body and body.name:
+                new_body = cls.only_child_policy(body)
+                if new_body != body and isinstance(new_body, NavigableString):
+                    # If body was replaced with text, wrap it in a new body tag
+                    new_body_tag = soup.new_tag('body')
+                    new_body_tag.append(new_body)
+                    body = new_body_tag
+                elif new_body != body:
+                    body = new_body
+            
+            # Remove empty elements
+            if body:
+                for tag_name in cls.TO_REMOVE_IF_EMPTY:
+                    elements = body.find_all(tag_name)
+                    # Sort by content length
+                    elements.sort(key=lambda x: len(x.get_text(strip=True)))
+                    for element in elements:
+                        if not element.get_text(strip=True):
+                            element.decompose()
+                
+                # Add context_element class to first child
+                if body.contents:
+                    first_child = None
+                    for child in body.contents:
+                        if not isinstance(child, NavigableString):
+                            first_child = child
+                            break
+                    
+                    if first_child and hasattr(first_child, 'attrs'):
+                        if 'class' not in first_child.attrs:
+                            first_child.attrs['class'] = []
+                        if 'context_element' not in first_child.attrs['class']:
+                            first_child.attrs['class'].append('context_element')
+            
+            result = str(body) if body else ""
+            return cls.normalize_whitespace(result)
+            
+        except Exception as e:
+            logging.error(f"Error in clean_html: {str(e)}")
+            # Return original HTML if cleaning fails
+            return html_string
+    
+    @classmethod
+    def clean_html_iterative(cls, html_string):
+        """Apply cleaning iteratively until no more changes"""
+        if not html_string:
+            return ""
+            
+        last_length = float('inf')
+        html = html_string
+        iterations = 0
+        max_iterations = 10  # Prevent infinite loops
+        
+        while len(html) < last_length and iterations < max_iterations:
+            last_length = len(html)
+            html = cls.clean_html(html)
+            iterations += 1
+        
+        return html
+
+
+def html_to_markdown(html_string):
+    """Convert HTML to markdown using html2text"""
+    h = html2text.HTML2Text()
+    h.ignore_links = False
+    h.ignore_images = True
+    h.ignore_emphasis = False
+    h.body_width = 0  # Don't wrap lines
+    h.unicode_snob = True
+    h.skip_internal_links = False
+    
+    try:
+        markdown = h.handle(html_string)
+        # Clean up excessive newlines
+        markdown = re.sub(r'\n{3,}', '\n\n', markdown)
+        return markdown.strip()
+    except Exception as e:
+        logging.error(f"Error converting HTML to markdown: {str(e)}")
+        return None
+
+
 def create_s3_client():
     """Create S3 client for each process"""
     return boto3.client('s3')
+
 
 def fetch_page_content(row, s3_client):
     """
@@ -77,70 +268,66 @@ def fetch_page_content(row, s3_client):
         logging.error(f"Error fetching {row['url']}: {str(e)}")
         return None
 
-def extract_text_from_content(content_data, process_text=True):
+
+def extract_text_from_content(content_data):
     """Extract text from content data"""
     if not content_data or not content_data.get('content'):
-        return None, None
+        return None
 
     content = content_data['content']
     content_type = content_data.get('content_type', '').lower()
     url = content_data.get('url', '')
 
+    # Handle PDF content
     if 'application/pdf' in content_type or url.endswith('.pdf'):
         try:
             with pdfplumber.open(BytesIO(content)) as pdf:
                 full_text = "".join(page.extract_text() or "" for page in pdf.pages)
-            return (full_text.strip(), full_text.strip()) if full_text.strip() else (None, None)
-        except Exception:
-            return (None, None)
+            return full_text.strip() if full_text.strip() else None
+        except Exception as e:
+            logging.error(f"Error extracting PDF from {url}: {str(e)}")
+            return None
 
+    # Handle HTML content
     is_html_like = ('text/html' in content_type or
-                    url.endswith(('.html', '.htm', '.asp', '.aspx')))
+                    url.endswith(('.html', '.htm', '.asp', '.aspx')) or
+                    'text/html' in content_type.lower())
 
     if is_html_like:
         try:
+            # Decode HTML
             try:
                 html_text = content.decode('utf-8')
             except UnicodeDecodeError:
                 html_text = content.decode('latin-1', errors='ignore')
             
-            if not process_text:
-                return (None, html_text)
-                
-            doc = Document(html_text)
+            # Sanitize HTML using custom sanitizer
+            sanitized_html = HTMLSanitizer.clean_html_iterative(html_text)
             
-            cleaned_html = doc.summary()
-            soup = BeautifulSoup(cleaned_html, 'html.parser')
+            # Convert to markdown
+            markdown_text = html_to_markdown(sanitized_html)
             
-            text = soup.get_text(separator='\n', strip=True)
-            
-            if not text.strip():
-                soup = BeautifulSoup(html_text, 'html.parser')
-                for script in soup(["script", "style", "nav", "header", "footer", "aside"]):
-                    script.decompose()
-                body = soup.find('body')
-                if body:
-                    text = body.get_text(separator='\n', strip=True)
+            return markdown_text
 
-            return (text.strip(), html_text) if text.strip() else (None, html_text)
+        except Exception as e:
+            logging.error(f"Error processing HTML from {url}: {str(e)}")
+            return None
 
-        except Exception:
-            return None, None
+    return None
 
-    return None, None
 
-def save_host_content(host_content, host_name, base_path='/Users/eloireynal/Documents/My projects/crawl_data', extension="txt"):
-    """Save concatenated content for each host"""
+def save_host_content(host_content, host_name, base_path='/Users/eloireynal/Documents/My projects/crawl_data/txt'):
+    """Save concatenated content for each host as markdown"""
     os.makedirs(base_path, exist_ok=True)
     safe_host = host_name.replace('/', '_').replace('\\', '_').replace(':', '_')
-    filepath = os.path.join(base_path, extension, f"{safe_host}.{extension}")
+    filepath = os.path.join(base_path, f"{safe_host}.md")
     
     try:
         with open(filepath, 'w', encoding='utf-8') as f:
             for url, text in host_content.items():
-                f.write(f"########## {url}\n")
+                f.write(f"# {url}\n\n")
                 f.write(text)
-                f.write("\n\n")
+                f.write("\n\n---\n\n")  # Markdown separator between pages
         
         logging.info(f"Saved content for {host_name} to {filepath}")
         return True
@@ -148,18 +335,20 @@ def save_host_content(host_content, host_name, base_path='/Users/eloireynal/Docu
         logging.error(f"Error saving content for {host_name}: {str(e)}")
         return False
 
-def process_single_url(row, s3_client, process_text=True):
+
+def process_single_url(row, s3_client):
     """Process a single URL and return the result"""
     try:
         content_data = fetch_page_content(row, s3_client)
-        text, html = extract_text_from_content(content_data, process_text)
+        text = extract_text_from_content(content_data)
         
-        return row['url'], text, html, len(text) if text else 0
+        return row['url'], text, len(text) if text else 0
     except Exception as e:
         logging.error(f"Error processing {row['url']}: {str(e)}")
         return row['url'], None, 0
 
-def process_host_group(host_data, save_text=False):
+
+def process_host_group(host_data):
     """Process all URLs for a single host"""
     host_name, group_df = host_data
     
@@ -169,39 +358,35 @@ def process_host_group(host_data, save_text=False):
     s3_client = create_s3_client()
     
     host_content = {}
-    host_content_html = {}
     successful_extractions = 0
     
     # Process URLs for this host using thread pool for I/O operations
     with ThreadPoolExecutor(max_workers=10) as executor:
         # Submit all tasks
         future_to_row = {
-            executor.submit(process_single_url, row, s3_client, save_text): row 
+            executor.submit(process_single_url, row, s3_client): row 
             for _, row in group_df.iterrows()
         }
         
         # Process completed tasks
         for future in as_completed(future_to_row):
-            url, text, html, text_length = future.result()
+            url, text, text_length = future.result()
             
-            if html:
-                host_content_html[url] = html
             if text:
                 host_content[url] = text
                 successful_extractions += 1
                 logging.debug(f"Successfully extracted {text_length} characters from {url}")
     
     # Save the content for this host
-    if host_content and save_text:
+    if host_content:
         save_host_content(host_content, host_name)
-    if host_content_html:
-        save_host_content(host_content_html, host_name, extension='.html')
     
     logging.info(f"Completed host: {host_name} - {successful_extractions}/{len(group_df)} URLs extracted")
     
     return host_name, successful_extractions, len(group_df)
 
-def process_all_records_parallel(start_index=0, max_workers=None, save_text=True):
+
+def process_all_records_parallel(start_index=0, max_workers=None):
     """Process all records in parallel, grouped by host"""
     
     # Load the dataframe
@@ -235,7 +420,7 @@ def process_all_records_parallel(start_index=0, max_workers=None, save_text=True
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         # Submit all tasks
         future_to_host = {
-            executor.submit(process_host_group, host_data, save_text): host_data[0] 
+            executor.submit(process_host_group, host_data): host_data[0] 
             for host_data in host_groups
         }
         
@@ -270,7 +455,8 @@ def process_all_records_parallel(start_index=0, max_workers=None, save_text=True
         f"Average rate: {completed_hosts/elapsed_total:.2f} hosts/sec"
     )
 
+
 if __name__ == "__main__":
     # You can adjust max_workers based on your system capabilities
     # More workers = faster processing but more memory/CPU usage
-    process_all_records_parallel(start_index=10019, max_workers=8, save_text=False)
+    process_all_records_parallel(start_index=0, max_workers=8)
