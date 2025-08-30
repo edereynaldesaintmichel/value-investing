@@ -11,155 +11,55 @@ import gzip
 import json
 import requests
 from datasets import load_dataset
+from helpers.chunk_texts_intelligently import split_text
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class Config:
-    """Configuration class for processing parameters"""
-    CACHE_DIR = "./cache"
-    MAX_CONTEXT_LEN = 8192
-    MIN_CONTEXT_LEN = 512
-    MIN_SUB_SEQUENCES = 2
-    MAX_SUB_SEQUENCES = 64
-    BATCH_SIZE = 8
+    # Data and Model Paths
+    DATA_DIR = "/Users/eloireynal/Documents/My projects/crawl_data/sanitized_txt/"
+    BASE_MODEL_NAME = "answerdotai/ModernBERT-base"
+    CHECKPOINT_DIR = "checkpoints"
+    CACHE_DIR = "embedding_cache"
     
-    # Wikipedia specific settings
-    MIN_ARTICLE_LENGTH = 500  # Minimum characters for an article to be considered
-    MAX_ARTICLES_TO_LOAD = 100000  # Limit for memory management
+    # Hierarchical Model Architecture
+    EMBEDDING_DIM = 768
+    NUM_LAYERS = 3
+    NUM_ATTENTION_HEADS = 4
+    FFN_DIM_MULTIPLIER = 4
+    
+    # Training Parameters
+    EPOCHS = 7
+    LEARNING_RATE = 1e-4
+    BATCH_SIZE = 16
+    TRAIN_SPLIT_RATIO = 0.9
+    
+    # Data Processing
+    MAX_CONTEXT_LEN = 8000
+    MIN_CONTEXT_LEN = 512
+    MAX_SUB_SEQUENCE_LENGTH = 512
+    MIN_SUB_SEQUENCE_LENGTH = 10
+    
+    # Preprocessing
+    MAX_EXAMPLES_TO_GENERATE = 100000
+    PREPROCESSING_BATCH_SIZE = 8
+    
 
 def ensure_cache_dir():
     """Ensure cache directory exists"""
     os.makedirs(Config.CACHE_DIR, exist_ok=True)
 
-def download_wikipedia_alternative():
-    """
-    Download Wikipedia-like dataset from alternative sources.
-    Using wikimedia/wikipedia dataset or other alternatives.
-    """
-    logging.info("Downloading Wikipedia dataset from alternative source...")
-    
-    try:
-        # Option 1: Try the new wikimedia/wikipedia dataset (most up-to-date)
-        try:
-            logging.info("Attempting to load wikimedia/wikipedia dataset...")
-            wiki_dataset = load_dataset(
-                "wikimedia/wikipedia", 
-                "20231101.en",  # English Wikipedia snapshot
-                split="train",
-                streaming=True  # Use streaming to avoid loading entire dataset into memory
-            )
-            logging.info("Successfully loaded wikimedia/wikipedia dataset")
-            return wiki_dataset, "wikimedia"
-        except Exception as e:
-            logging.warning(f"Could not load wikimedia/wikipedia: {e}")
-        
-        # Option 2: Try Wikipedia sample datasets
-        try:
-            logging.info("Attempting to load wikipedia sample dataset...")
-            wiki_dataset = load_dataset(
-                "Cohere/wikipedia-22-12-en-embeddings",
-                split="train",
-                streaming=True
-            )
-            logging.info("Successfully loaded Cohere Wikipedia dataset")
-            return wiki_dataset, "cohere"
-        except Exception as e:
-            logging.warning(f"Could not load Cohere dataset: {e}")
-        
-        # Option 3: Use a general text dataset as fallback
-        try:
-            logging.info("Falling back to wikitext dataset...")
-            wiki_dataset = load_dataset(
-                "wikitext", 
-                "wikitext-103-v1",
-                split="train",
-                streaming=False  # Wikitext is smaller, can load fully
-            )
-            logging.info("Successfully loaded wikitext dataset")
-            return wiki_dataset, "wikitext"
-        except Exception as e:
-            logging.warning(f"Could not load wikitext: {e}")
-            
-        # Option 4: Use OpenWebText as final fallback
-        logging.info("Final fallback to OpenWebText dataset...")
-        wiki_dataset = load_dataset(
-            "Skylion007/openwebtext",
-            split="train",
-            streaming=True
-        )
-        logging.info("Successfully loaded OpenWebText dataset")
-        return wiki_dataset, "openwebtext"
-        
-    except Exception as e:
-        logging.error(f"Error downloading any dataset: {e}")
-        raise
+def download_wikipedia():
+    wiki_dataset = load_dataset(
+        "wikimedia/wikipedia", 
+        "20231101.en",  # English Wikipedia snapshot
+        split="train",
+        streaming=True  # Use streaming to avoid loading entire dataset into memory
+    )
+    logging.info("Successfully loaded wikimedia/wikipedia dataset")
+    return wiki_dataset, "wikimedia"
 
-def sensible_split(text: str, num_chunks: int) -> List[str]:
-    """Splits text into a number of chunks at sensible points (punctuation/newlines)."""
-    split_points = [m.start() for m in re.finditer(r'[.?!]\s|\n', text)]
-    
-    if len(split_points) < num_chunks - 1:
-        chunk_size = len(text) // num_chunks
-        return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)][:num_chunks]
-    
-    chosen_indices = sorted(random.sample(split_points, num_chunks - 1))
-    chunks = []
-    start_idx = 0
-    
-    for split_idx in chosen_indices:
-        chunks.append(text[start_idx:split_idx+1].strip())
-        start_idx = split_idx + 1
-    
-    chunks.append(text[start_idx:].strip())
-    return [chunk for chunk in chunks if chunk]
-
-def extract_text_chunks_from_article(article_text: str, num_chunks: int = 5) -> List[str]:
-    """
-    Extract multiple random chunks from a single article.
-    Each chunk will be of varying length between MIN_CONTEXT_LEN and MAX_CONTEXT_LEN tokens.
-    """
-    chunks = []
-    article_length = len(article_text)
-    
-    if article_length < Config.MIN_ARTICLE_LENGTH:
-        return chunks
-    
-    for _ in range(num_chunks):
-        # Randomly select chunk size in characters (approximate)
-        # Assuming ~4 characters per token on average
-        min_chars = Config.MIN_CONTEXT_LEN * 4
-        max_chars = min(Config.MAX_CONTEXT_LEN * 4, article_length)
-        
-        if min_chars >= article_length:
-            continue
-            
-        chunk_size = random.randint(min_chars, min(max_chars, article_length))
-        
-        # Random starting position
-        max_start = article_length - chunk_size
-        if max_start <= 0:
-            start_pos = 0
-        else:
-            start_pos = random.randint(0, max_start)
-        
-        chunk = article_text[start_pos:start_pos + chunk_size]
-        
-        # Try to find sentence boundaries for cleaner chunks
-        # Look for the first sentence start
-        first_period = chunk.find('. ')
-        if first_period > 0 and first_period < 100:
-            chunk = chunk[first_period + 2:]
-        
-        # Look for the last complete sentence
-        last_period = chunk.rfind('. ')
-        if last_period > len(chunk) - 100 and last_period > 0:
-            chunk = chunk[:last_period + 1]
-        
-        if len(chunk.strip()) >= Config.MIN_ARTICLE_LENGTH:
-            chunks.append(chunk.strip())
-    
-    return chunks
 
 def extract_text_from_dataset_item(item: Dict, dataset_type: str) -> Tuple[str, str]:
     """
@@ -168,32 +68,14 @@ def extract_text_from_dataset_item(item: Dict, dataset_type: str) -> Tuple[str, 
     Returns:
         Tuple of (text, title)
     """
-    if dataset_type == "wikimedia":
         # wikimedia/wikipedia format
-        text = item.get('text', '')
-        title = item.get('title', 'Unknown')
-    elif dataset_type == "cohere":
-        # Cohere Wikipedia format
-        text = item.get('text', item.get('passage', ''))
-        title = item.get('title', item.get('id', 'Unknown'))
-    elif dataset_type == "wikitext":
-        # Wikitext format - it's just raw text
-        text = item.get('text', '')
-        title = "WikiText Article"
-    elif dataset_type == "openwebtext":
-        # OpenWebText format
-        text = item.get('text', '')
-        title = "OpenWebText Document"
-    else:
-        # Generic fallback
-        text = str(item.get('text', item))
-        title = "Unknown Source"
+    text = item.get('text', '')
+    title = item.get('title', 'Unknown')
     
     return text, title
 
 def process_wikipedia_to_training_examples(
     num_examples: int = 5000,
-    examples_per_article: int = 3,
     cache_file_prefix: str = "wikipedia"
 ) -> Tuple[List[Tuple[str, List[str]]], List[Dict[str, Any]]]:
     """
@@ -224,7 +106,7 @@ def process_wikipedia_to_training_examples(
         return texts_to_process, metadata
     
     # Download Wikipedia or alternative dataset
-    dataset, dataset_type = download_wikipedia_alternative()
+    dataset, dataset_type = download_wikipedia()
     
     texts_to_process = []
     metadata = []
@@ -239,60 +121,43 @@ def process_wikipedia_to_training_examples(
     else:
         dataset_iter = dataset
     
+    max_target_chars = int(Config.MAX_CONTEXT_LEN * 4)
+    min_target_chars = int(Config.MIN_CONTEXT_LEN * 4)
+    min_sub_chars = int(Config.MIN_SUB_SEQUENCE_LENGTH * 4)
+    max_sub_chars = int(Config.MAX_SUB_SEQUENCE_LENGTH * 4)
+    
     # Process articles from the dataset
     for article in dataset_iter:
         if len(texts_to_process) >= num_examples:
             break
-            
-        if articles_processed >= Config.MAX_ARTICLES_TO_LOAD:
-            break
-            
-        try:
-            # Extract text and title based on dataset type
-            article_text, article_title = extract_text_from_dataset_item(article, dataset_type)
-            
-            # Skip short articles
-            if len(article_text.strip()) < Config.MIN_ARTICLE_LENGTH:
-                continue
-            
-            # Extract chunks from this article
-            chunks = extract_text_chunks_from_article(article_text, examples_per_article)
-            
-            for chunk_text in chunks:
-                if len(texts_to_process) >= num_examples:
-                    break
-                
-                # Create sub-sequences from the chunk
-                num_sub_sequences = random.randint(
-                    Config.MIN_SUB_SEQUENCES, 
-                    min(Config.MAX_SUB_SEQUENCES, max(2, len(chunk_text) // 100))
-                )
-                
-                sub_sequence_texts = sensible_split(chunk_text, num_sub_sequences)
-                
-                if len(sub_sequence_texts) < 2:
-                    continue
-                
-                texts_to_process.append((chunk_text, sub_sequence_texts))
-                metadata.append({
-                    'source_file': f"{dataset_type}:{article_title}",
-                    'num_sequences': len(sub_sequence_texts),
-                    'article_id': article.get('id', 'unknown') if isinstance(article, dict) else 'unknown',
-                    'chunk_length': len(chunk_text),
-                    'dataset_type': dataset_type
-                })
-                
-                pbar.update(1)
-            
-            articles_processed += 1
-            
-            # Log progress every 100 articles
-            if articles_processed % 100 == 0:
-                logging.info(f"Processed {articles_processed} articles, created {len(texts_to_process)} examples")
-                
-        except Exception as e:
-            logging.warning(f"Error processing article: {e}")
+        
+        full_text, article_title = extract_text_from_dataset_item(article, dataset_type)
+        
+        if len(full_text.strip()) < Config.MIN_CONTEXT_LEN * 4 * 2:
             continue
+        
+        target_chunk_size = random.randint(min_target_chars, max_target_chars)
+        target_chunks = split_text(full_text, chunk_length=target_chunk_size)
+        subtext_chunk_size = random.randint(min_sub_chars, min(max_sub_chars, target_chunk_size//3)) # I want at least 3 sub_sequences
+        
+        for target_chunk_text in target_chunks:
+            estimated_tokens = int(len(target_chunk_text) / 4)
+            sub_sequence_texts = split_text(target_chunk_text, subtext_chunk_size)
+            texts_to_process.append((target_chunk_text, sub_sequence_texts))
+            metadata.append({
+                'source_file': f"{dataset_type}:{article_title}",
+                'num_sequences': len(sub_sequence_texts),
+                'chunk_chars': len(target_chunk_text),
+                'estimated_tokens': estimated_tokens
+            })
+        
+        articles_processed += 1
+        pbar.update(1)
+        
+        # Log progress every 100 articles
+        # if articles_processed % 100 == 0:
+        #     logging.info(f"Processed {articles_processed} articles, created {len(texts_to_process)} examples")
+                
     
     pbar.close()
     
@@ -358,11 +223,11 @@ def analyze_dataset(texts_to_process: List[Tuple[str, List[str]]], metadata: Lis
 
 def main():
     parser = argparse.ArgumentParser(description="Process Wikipedia into training examples")
-    parser.add_argument('--num-examples', type=int, default=10000, 
+    parser.add_argument('--num-examples', type=int, default=500000, 
                        help='Number of training examples to create')
     parser.add_argument('--examples-per-article', type=int, default=3,
                        help='Number of examples to extract from each article')
-    parser.add_argument('--cache-prefix', type=str, default='wikipedia_val',
+    parser.add_argument('--cache-prefix', type=str, default='wikipedia',
                        help='Prefix for cache files')
     parser.add_argument('--analyze-only', action='store_true',
                        help='Only analyze existing cached data')
@@ -386,7 +251,6 @@ def main():
         # Process Wikipedia and create training examples
         texts_to_process, metadata = process_wikipedia_to_training_examples(
             num_examples=args.num_examples,
-            examples_per_article=args.examples_per_article,
             cache_file_prefix=args.cache_prefix
         )
         

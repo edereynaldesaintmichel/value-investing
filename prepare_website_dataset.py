@@ -1,381 +1,216 @@
-import os
-import re
-import random
-import pickle
 import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from transformers import AutoTokenizer, AutoModel
+import transformers
+print(transformers.__version__)
+
+import os
+import glob
+import random
+import numpy as np
+import re
+from sklearn.model_selection import train_test_split
 from tqdm import tqdm
-import argparse
-from typing import List, Tuple, Dict, Any
-import gzip
-import json
-import requests
-from datasets import load_dataset
+import logging
+import pickle
+import gc
+from helpers.chunk_texts_intelligently import split_text
 
+
+# --- 1. Configuration ---
 class Config:
-    """Configuration class for processing parameters"""
-    CACHE_DIR = "./cache"
-    MAX_CONTEXT_LEN = 8192
+    # Data and Model Paths
+    DATA_DIR = "/Users/eloireynal/Documents/My projects/crawl_data/sanitized_txt/"
+    BASE_MODEL_NAME = "answerdotai/ModernBERT-base"
+    CHECKPOINT_DIR = "checkpoints"
+    CACHE_DIR = "embedding_cache"
+    
+    # Hierarchical Model Architecture
+    EMBEDDING_DIM = 768
+    NUM_LAYERS = 3
+    NUM_ATTENTION_HEADS = 4
+    FFN_DIM_MULTIPLIER = 4
+    
+    # Training Parameters
+    EPOCHS = 7
+    LEARNING_RATE = 1e-4
+    BATCH_SIZE = 16
+    TRAIN_SPLIT_RATIO = 0.9
+    
+    # Data Processing
+    MAX_CONTEXT_LEN = 8000
     MIN_CONTEXT_LEN = 512
-    MIN_SUB_SEQUENCES = 2
-    MAX_SUB_SEQUENCES = 64
-    BATCH_SIZE = 8
+    MAX_SUB_SEQUENCE_LENGTH = 512
+    MIN_SUB_SEQUENCE_LENGTH = 10
     
-    # Wikipedia specific settings
-    MIN_ARTICLE_LENGTH = 500  # Minimum characters for an article to be considered
-    MAX_ARTICLES_TO_LOAD = 100000  # Limit for memory management
-
-def ensure_cache_dir():
-    """Ensure cache directory exists"""
-    os.makedirs(Config.CACHE_DIR, exist_ok=True)
-
-def download_wikipedia_alternative():
-    """
-    Download Wikipedia-like dataset from alternative sources.
-    Using wikimedia/wikipedia dataset or other alternatives.
-    """
+    # Preprocessing
+    MAX_EXAMPLES_TO_GENERATE = 100000
+    PREPROCESSING_BATCH_SIZE = 8
     
-    try:
-        # Option 1: Try the new wikimedia/wikipedia dataset (most up-to-date)
+    # Token ratio calculation
+    SAMPLE_FILES_FOR_RATIO = 20  # Number of files to sample for ratio calculation
+    
+    # System
+    DEVICE = "mps"
+
+# --- Setup Logging and Directories ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+os.makedirs(Config.CHECKPOINT_DIR, exist_ok=True)
+os.makedirs(Config.CACHE_DIR, exist_ok=True)
+
+# --- 2. Token Ratio Calculation ---
+def calculate_token_char_ratio(file_paths, tokenizer, num_samples=20):
+    """
+    Calculate the average token-to-character ratio from sample files.
+    """
+    sample_files = random.sample(file_paths, min(num_samples, len(file_paths)))
+    
+    total_chars = 0
+    total_tokens = 0
+    
+    logging.info(f"Calculating token-to-character ratio from {len(sample_files)} sample files...")
+    
+    for file_path in tqdm(sample_files, desc="Analyzing token ratio"):
         try:
-            wiki_dataset = load_dataset(
-                "wikimedia/wikipedia", 
-                "20231101.en",  # English Wikipedia snapshot
-                split="train",
-                streaming=True  # Use streaming to avoid loading entire dataset into memory
-            )
-            return wiki_dataset, "wikimedia"
-        except Exception as e:
-            pass
-        
-        # Option 2: Try Wikipedia sample datasets
-        try:
-            wiki_dataset = load_dataset(
-                "Cohere/wikipedia-22-12-en-embeddings",
-                split="train",
-                streaming=True
-            )
-            return wiki_dataset, "cohere"
-        except Exception as e:
-            pass
-        
-        # Option 3: Use a general text dataset as fallback
-        try:
-            wiki_dataset = load_dataset(
-                "wikitext", 
-                "wikitext-103-v1",
-                split="train",
-                streaming=False  # Wikitext is smaller, can load fully
-            )
-            return wiki_dataset, "wikitext"
-        except Exception as e:
-            pass
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                text = f.read()
             
-        # Option 4: Use OpenWebText as final fallback
-        wiki_dataset = load_dataset(
-            "Skylion007/openwebtext",
-            split="train",
-            streaming=True
-        )
-        return wiki_dataset, "openwebtext"
-        
-    except Exception as e:
-        raise
-
-def sensible_split(text: str, num_chunks: int) -> List[str]:
-    """Splits text into a number of chunks at sensible points (punctuation/newlines)."""
-    split_points = [m.start() for m in re.finditer(r'[.?!]\s|\n', text)]
-    
-    if len(split_points) < num_chunks - 1:
-        chunk_size = len(text) // num_chunks
-        return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)][:num_chunks]
-    
-    chosen_indices = sorted(random.sample(split_points, num_chunks - 1))
-    chunks = []
-    start_idx = 0
-    
-    for split_idx in chosen_indices:
-        chunks.append(text[start_idx:split_idx+1].strip())
-        start_idx = split_idx + 1
-    
-    chunks.append(text[start_idx:].strip())
-    return [chunk for chunk in chunks if chunk]
-
-def extract_text_chunks_from_article(article_text: str, num_chunks: int = 5) -> List[str]:
-    """
-    Extract multiple random chunks from a single article.
-    Each chunk will be of varying length between MIN_CONTEXT_LEN and MAX_CONTEXT_LEN tokens.
-    """
-    chunks = []
-    article_length = len(article_text)
-    
-    if article_length < Config.MIN_ARTICLE_LENGTH:
-        return chunks
-    
-    for _ in range(num_chunks):
-        # Randomly select chunk size in characters (approximate)
-        # Assuming ~4 characters per token on average
-        min_chars = Config.MIN_CONTEXT_LEN * 4
-        max_chars = min(Config.MAX_CONTEXT_LEN * 4, article_length)
-        
-        if min_chars >= article_length:
+            # Take multiple chunks from each file for better average
+            chunk_size = 10000  # 10k characters per chunk
+            for i in range(0, min(len(text), 50000), chunk_size):  # Max 5 chunks per file
+                chunk = text[i:i+chunk_size]
+                if len(chunk) < 100:
+                    continue
+                    
+                tokenized = tokenizer(chunk, return_tensors="pt", truncation=False)
+                num_tokens = tokenized['input_ids'].shape[1]
+                
+                total_chars += len(chunk)
+                total_tokens += num_tokens
+                
+        except Exception as e:
+            logging.warning(f"Error processing {file_path} for ratio calculation: {e}")
             continue
-            
-        chunk_size = random.randint(min_chars, min(max_chars, article_length))
-        
-        # Random starting position
-        max_start = article_length - chunk_size
-        if max_start <= 0:
-            start_pos = 0
-        else:
-            start_pos = random.randint(0, max_start)
-        
-        chunk = article_text[start_pos:start_pos + chunk_size]
-        
-        # Try to find sentence boundaries for cleaner chunks
-        # Look for the first sentence start
-        first_period = chunk.find('. ')
-        if first_period > 0 and first_period < 100:
-            chunk = chunk[first_period + 2:]
-        
-        # Look for the last complete sentence
-        last_period = chunk.rfind('. ')
-        if last_period > len(chunk) - 100 and last_period > 0:
-            chunk = chunk[:last_period + 1]
-        
-        if len(chunk.strip()) >= Config.MIN_ARTICLE_LENGTH:
-            chunks.append(chunk.strip())
     
-    return chunks
+    if total_chars == 0:
+        logging.warning("No valid text found for ratio calculation. Using default ratio.")
+        return 0.3  # Fallback ratio (roughly 3.3 chars per token)
+    
+    ratio = total_tokens / total_chars
+    chars_per_token = total_chars / total_tokens
+    
+    logging.info(f"Token-to-character ratio: {ratio:.4f} tokens per char")
+    logging.info(f"Character-to-token ratio: {chars_per_token:.2f} chars per token")
+    
+    return ratio
 
-def extract_text_from_dataset_item(item: Dict, dataset_type: str) -> Tuple[str, str]:
+def preprocess_and_cache_embeddings(file_paths, token_char_ratio, cache_file_prefix):
     """
-    Extract text and title from different dataset formats.
-    
-    Returns:
-        Tuple of (text, title)
+    Pre-process files and create cached embeddings using character-based chunking
+    with the calculated token-to-character ratio.
     """
-    if dataset_type == "wikimedia":
-        # wikimedia/wikipedia format
-        text = item.get('text', '')
-        title = item.get('title', 'Unknown')
-    elif dataset_type == "cohere":
-        # Cohere Wikipedia format
-        text = item.get('text', item.get('passage', ''))
-        title = item.get('title', item.get('id', 'Unknown'))
-    elif dataset_type == "wikitext":
-        # Wikitext format - it's just raw text
-        text = item.get('text', '')
-        title = "WikiText Article"
-    elif dataset_type == "openwebtext":
-        # OpenWebText format
-        text = item.get('text', '')
-        title = "OpenWebText Document"
-    else:
-        # Generic fallback
-        text = str(item.get('text', item))
-        title = "Unknown Source"
+    cache_file = os.path.join(Config.CACHE_DIR, f"{cache_file_prefix}_embeddings.pkl")
     
-    return text, title
-
-def process_wikipedia_to_training_examples(
-    num_examples: int = 5000,
-    examples_per_article: int = 3,
-    cache_file_prefix: str = "wikipedia"
-) -> Tuple[List[Tuple[str, List[str]]], List[Dict[str, Any]]]:
-    """
-    Process Wikipedia articles into training examples with the same structure
-    as the original function.
+    if os.path.exists(cache_file):
+        logging.info(f"Cache file {cache_file} already exists. Loading...")
+        with open(cache_file, 'rb') as f:
+            return pickle.load(f)
     
-    Args:
-        num_examples: Total number of training examples to create
-        examples_per_article: Number of examples to extract from each article
-        cache_file_prefix: Prefix for cache files
-        
-    Returns:
-        Tuple of (texts_to_process, metadata) with same structure as original
-    """
-    ensure_cache_dir()
+    logging.info(f"Creating new cache file: {cache_file}")
     
-    # Check if processed data already exists
-    texts_cache_file = os.path.join(Config.CACHE_DIR, f"{cache_file_prefix}_texts_to_process.pkl")
-    metadata_cache_file = os.path.join(Config.CACHE_DIR, f"{cache_file_prefix}_metadata.pkl")
+    # Convert token lengths to character lengths using the ratio
+    max_target_chars = int(Config.MAX_CONTEXT_LEN / token_char_ratio)
+    min_target_chars = int(Config.MIN_CONTEXT_LEN / token_char_ratio)
+    min_sub_chars = int(Config.MIN_SUB_SEQUENCE_LENGTH / token_char_ratio)
+    max_sub_chars = int(Config.MAX_SUB_SEQUENCE_LENGTH / token_char_ratio)
     
-    if os.path.exists(texts_cache_file) and os.path.exists(metadata_cache_file):
-        with open(texts_cache_file, 'rb') as f:
-            texts_to_process = pickle.load(f)
-        with open(metadata_cache_file, 'rb') as f:
-            metadata = pickle.load(f)
-        return texts_to_process, metadata
-    
-    # Download Wikipedia or alternative dataset
-    dataset, dataset_type = download_wikipedia_alternative()
+    logging.info(f"Using character limits: {min_target_chars} to {max_target_chars} (based on token limits {Config.MIN_CONTEXT_LEN} to {Config.MAX_CONTEXT_LEN})")
     
     texts_to_process = []
     metadata = []
-    articles_processed = 0
     
-    # Create progress bar
-    pbar = tqdm(total=num_examples, desc="Creating training examples")
-    
-    # Handle both streaming and non-streaming datasets
-    if hasattr(dataset, '__iter__'):
-        dataset_iter = iter(dataset)
-    else:
-        dataset_iter = dataset
-    
-    # Process articles from the dataset
-    for article in dataset_iter:
-        if len(texts_to_process) >= num_examples:
-            break
-            
-        if articles_processed >= Config.MAX_ARTICLES_TO_LOAD:
-            break
-            
-        try:
-            # Extract text and title based on dataset type
-            article_text, article_title = extract_text_from_dataset_item(article, dataset_type)
-            
-            # Skip short articles
-            if len(article_text.strip()) < Config.MIN_ARTICLE_LENGTH:
-                continue
-            
-            # Extract chunks from this article
-            chunks = extract_text_chunks_from_article(article_text, examples_per_article)
-            
-            for chunk_text in chunks:
-                if len(texts_to_process) >= num_examples:
-                    break
-                
-                # Create sub-sequences from the chunk
-                num_sub_sequences = random.randint(
-                    Config.MIN_SUB_SEQUENCES, 
-                    min(Config.MAX_SUB_SEQUENCES, max(2, len(chunk_text) // 100))
-                )
-                
-                sub_sequence_texts = sensible_split(chunk_text, num_sub_sequences)
-                
-                if len(sub_sequence_texts) < 2:
-                    continue
-                
-                texts_to_process.append((chunk_text, sub_sequence_texts))
-                metadata.append({
-                    'source_file': f"{dataset_type}:{article_title}",
-                    'num_sequences': len(sub_sequence_texts),
-                    'article_id': article.get('id', 'unknown') if isinstance(article, dict) else 'unknown',
-                    'chunk_length': len(chunk_text),
-                    'dataset_type': dataset_type
-                })
-                
-                pbar.update(1)
-            
-            articles_processed += 1
-            
-            # Log progress every 100 articles
-            if articles_processed % 100 == 0:
-                pass
-                
-        except Exception as e:
-            pass
+    pbar = tqdm(file_paths, desc=f"Reading files for {cache_file_prefix}")
+    for file_path in pbar:
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            full_text = f.read()
+        
+        if len(full_text.strip()) < min_target_chars:
             continue
+        
+        target_chunk_size = random.randint(min_target_chars, max_target_chars)
+        subtext_chunk_size = random.randint(min_sub_chars, min(max_sub_chars, target_chunk_size//3)) # I want at least 3 sub_sequences
+        target_chunks = split_text(full_text, chunk_length=target_chunk_size)
+
+        for target_chunk_text in target_chunks:
+            estimated_tokens = int(len(target_chunk_text) * token_char_ratio)
+            sub_sequence_texts = split_text(target_chunk_text, subtext_chunk_size)
+            texts_to_process.append((target_chunk_text, sub_sequence_texts))
+            metadata.append({
+                'source_file': file_path,
+                'num_sequences': len(sub_sequence_texts),
+                'chunk_chars': len(target_chunk_text),
+                'estimated_tokens': estimated_tokens
+            })
+                
     
-    pbar.close()
-    
-    
-    # Save processed data to cache
-    with open(texts_cache_file, 'wb') as f:
+    # Save the preprocessed data as pickle files
+    with open(os.path.join(Config.CACHE_DIR, f"{cache_file_prefix}_texts_to_process.pkl"), 'wb') as f:
         pickle.dump(texts_to_process, f)
-    with open(metadata_cache_file, 'wb') as f:
+    
+    with open(os.path.join(Config.CACHE_DIR, f"{cache_file_prefix}_metadata.pkl"), 'wb') as f:
         pickle.dump(metadata, f)
     
-    return texts_to_process, metadata
-
-def analyze_dataset(texts_to_process: List[Tuple[str, List[str]]], metadata: List[Dict[str, Any]]):
-    """Analyze and print statistics about the created dataset"""
-    print("\n" + "="*50)
-    print("Dataset Statistics:")
-    print("="*50)
-    
-    total_examples = len(texts_to_process)
-    print(f"Total training examples: {total_examples}")
-    
-    # Check dataset types
-    if metadata and 'dataset_type' in metadata[0]:
-        dataset_types = set(m.get('dataset_type', 'unknown') for m in metadata)
-        print(f"Dataset types used: {', '.join(dataset_types)}")
-    
-    # Analyze chunk lengths
-    chunk_lengths = [len(text[0]) for text in texts_to_process]
-    avg_chunk_length = sum(chunk_lengths) / len(chunk_lengths) if chunk_lengths else 0
-    min_chunk_length = min(chunk_lengths) if chunk_lengths else 0
-    max_chunk_length = max(chunk_lengths) if chunk_lengths else 0
-    
-    print(f"Chunk length - Avg: {avg_chunk_length:.0f}, Min: {min_chunk_length}, Max: {max_chunk_length}")
-    
-    # Analyze sub-sequences
-    num_subsequences = [len(text[1]) for text in texts_to_process]
-    avg_subsequences = sum(num_subsequences) / len(num_subsequences) if num_subsequences else 0
-    min_subsequences = min(num_subsequences) if num_subsequences else 0
-    max_subsequences = max(num_subsequences) if num_subsequences else 0
-    
-    print(f"Sub-sequences per example - Avg: {avg_subsequences:.1f}, Min: {min_subsequences}, Max: {max_subsequences}")
-    
-    # Show sample
-    if texts_to_process:
-        print("\n" + "="*50)
-        print("Sample Example:")
-        print("="*50)
-        sample_idx = random.randint(0, len(texts_to_process) - 1)
-        sample_text, sample_subsequences = texts_to_process[sample_idx]
-        sample_meta = metadata[sample_idx]
+    # Log statistics
+    if metadata:
+        avg_chars = np.mean([m['chunk_chars'] for m in metadata])
+        avg_tokens = np.mean([m['estimated_tokens'] for m in metadata])
+        avg_sequences = np.mean([m['num_sequences'] for m in metadata])
         
-        print(f"Source: {sample_meta['source_file']}")
-        print(f"Number of sub-sequences: {sample_meta['num_sequences']}")
-        print(f"Main chunk preview (first 200 chars): {sample_text[:200]}...")
-        print(f"First sub-sequence preview: {sample_subsequences[0][:100]}...")
+        logging.info(f"Preprocessing complete:")
+        logging.info(f"  - Total examples: {len(texts_to_process)}")
+        logging.info(f"  - Avg chunk size: {avg_chars:.0f} chars (~{avg_tokens:.0f} tokens)")
+        logging.info(f"  - Avg sub-sequences per chunk: {avg_sequences:.1f}")
+    
+    return texts_to_process
 
+# --- 4. Main Training Script ---
 def main():
-    parser = argparse.ArgumentParser(description="Process Wikipedia into training examples")
-    parser.add_argument('--num-examples', type=int, default=10000, 
-                       help='Number of training examples to create')
-    parser.add_argument('--examples-per-article', type=int, default=3,
-                       help='Number of examples to extract from each article')
-    parser.add_argument('--cache-prefix', type=str, default='wikipedia_val',
-                       help='Prefix for cache files')
-    parser.add_argument('--analyze-only', action='store_true',
-                       help='Only analyze existing cached data')
+    logging.info(f"Using device: {Config.DEVICE}")
     
-    args = parser.parse_args()
+    # --- Load Tokenizer ---
+    logging.info(f"Loading tokenizer: {Config.BASE_MODEL_NAME}")
+    tokenizer = AutoTokenizer.from_pretrained(Config.BASE_MODEL_NAME)
     
-    if args.analyze_only:
-        # Load existing data and analyze
-        texts_cache_file = os.path.join(Config.CACHE_DIR, f"{args.cache_prefix}_texts_to_process.pkl")
-        metadata_cache_file = os.path.join(Config.CACHE_DIR, f"{args.cache_prefix}_metadata.pkl")
-        
-        if os.path.exists(texts_cache_file) and os.path.exists(metadata_cache_file):
-            with open(texts_cache_file, 'rb') as f:
-                texts_to_process = pickle.load(f)
-            with open(metadata_cache_file, 'rb') as f:
-                metadata = pickle.load(f)
-            analyze_dataset(texts_to_process, metadata)
-        else:
-            print("No cached data found. Run without --analyze-only first.")
-    else:
-        # Process Wikipedia and create training examples
-        texts_to_process, metadata = process_wikipedia_to_training_examples(
-            num_examples=args.num_examples,
-            examples_per_article=args.examples_per_article,
-            cache_file_prefix=args.cache_prefix
-        )
-        
-        # Analyze the created dataset
-        analyze_dataset(texts_to_process, metadata)
-        
-        print(f"\nData saved to {Config.CACHE_DIR}/")
-        print("Files created:")
-        print(f"  - {args.cache_prefix}_texts_to_process.pkl")
-        print(f"  - {args.cache_prefix}_texts_to_process.pt")
-        print(f"  - {args.cache_prefix}_metadata.pkl")
-        print(f"  - {args.cache_prefix}_metadata.pt")
+    # --- Load file paths ---
+    logging.info(f"Loading data from: {Config.DATA_DIR}")
+    all_files = glob.glob(os.path.join(Config.DATA_DIR, "*.md"))
+    
+    if not all_files:
+        logging.error(f"No .md files found in {Config.DATA_DIR}")
+        return
+    
+    logging.info(f"Found {len(all_files)} files")
+    
+    # --- Calculate token-to-character ratio ---
+    token_char_ratio = calculate_token_char_ratio(all_files, tokenizer, Config.SAMPLE_FILES_FOR_RATIO)
+    
+    # --- Preprocess and cache ---
+    train_examples = preprocess_and_cache_embeddings(
+        all_files, 
+        token_char_ratio,
+        "website",
+    )
+    
+    logging.info("Preprocessing complete!")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        logging.error(f"An error occurred: {e}", exc_info=True)
+    finally:
+        if torch.cuda.is_available():
+            logging.info("Script finished or crashed. Clearing CUDA cache to release GPU memory.")
+            torch.cuda.empty_cache()
+            gc.collect()
